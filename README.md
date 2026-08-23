@@ -16,7 +16,7 @@ Right-click the tray icon to choose which temperature sensor is shown on the dis
 - **CPU Sensor** — lists every CPU temperature sensor LibreHardwareMonitor finds (e.g. `CPU Package`, `Tctl/Tdie`, `Core Max`, etc.). The active sensor is shown with a checkmark.
 - **GPU Sensor** — lists every GPU temperature sensor (e.g. `GPU Core`, `GPU Hot Spot`, etc.), with the active one checked.
 
-Selecting an entry switches the display to that sensor immediately and saves your choice to `appsettings.json` (as `SelectedCpuSensor` / `SelectedGpuSensor`), so it's remembered the next time the app starts.
+Selecting an entry switches the display to that sensor immediately and saves your choice to your per-user settings file (`%APPDATA%\FluxProDisplay\settings.json`), so it's remembered the next time the app starts — even across reboots, rebuilds, and re-installs.
 
 If no sensor has been chosen yet, the app picks a default: the CPU sensor named `Tctl/Tdie` or `CPU Package`, and the GPU sensor named `GPU Core`, falling back to the first available temperature sensor if those are not present.
 
@@ -27,5 +27,8 @@ If no sensor has been chosen yet, the app picks a default: the CPU sensor named 
 - [**PawnIO**](https://github.com/namazso/PawnIO): LibreHardwareMonitor uses the open-source PawnIO driver in order to fetch CPU temperatures. The reason being that before, LHM would use something called WinRing0 in order to fetch this data. However, WinRing0 has been found to open up your system to vulnerabilities with the way it accesses this data. More information can be found [here](https://support.microsoft.com/en-us/windows/microsoft-defender-antivirus-alert-vulnerabledriver-winnt-winring0-eb057830-d77b-41a2-9a34-015a5d203c42).
 
 ### Building Locally
-To build and export the project locally, I run this.
+To build and export the project locally, I run this:
+
 `dotnet publish -c Release -p:SelfContained=false`
+
+The published files are written to a single clean folder, `publish\` at the repository root (next to `FluxProDisplay.sln`), so you can copy that entire folder to `C:\Program Files` and launch `FluxProDisplay.exe` from there.

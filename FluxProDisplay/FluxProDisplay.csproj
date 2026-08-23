@@ -7,9 +7,15 @@
         <UseWindowsForms>true</UseWindowsForms>
         <ImplicitUsings>enable</ImplicitUsings>
         <ApplicationManifest>app.manifest</ApplicationManifest>
-        <PublishSingleFile>true</PublishSingleFile>
         <ApplicationIcon>Assets\app_icon.ico</ApplicationIcon>
         <EnableWindowsTargeting>true</EnableWindowsTargeting>
+        <!-- Bundle all managed DLLs into a single FluxProDisplay.exe. The native Mono
+             helpers and content files (appsettings.json, Assets, etc.) remain loose,
+             which is exactly the set the app needs to run. -->
+        <PublishSingleFile>true</PublishSingleFile>
+        <!-- Publish to a single, clean folder at the repo root (next to FluxProDisplay.sln)
+             instead of nesting inside bin\Release\... so it's easy to copy to Program Files. -->
+        <PublishDir>$(MSBuildProjectDirectory)\..\publish\</PublishDir>
     </PropertyGroup>
 
     <ItemGroup>
@@ -24,27 +30,27 @@
     <ItemGroup>
       <None Update="app.manifest">
         <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
       </None>
       <None Update="Assets\app_icon.ico">
         <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
       </None>
       <None Update="Assets\icon_connected.ico">
         <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
       </None>
       <None Update="Assets\icon_disconnected.ico">
         <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
       </None>
       <None Update="appsettings.json">
         <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
       </None>
       <None Update="NuGet.Config">
         <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
       </None>
     </ItemGroup>
 
@@ -58,5 +64,12 @@
         <CopyToPublishDirectory>Always</CopyToPublishDirectory>
       </EmbeddedResource>
     </ItemGroup>
+
+    <!-- Always publish into a clean directory. Single-file publish keeps an incremental
+         file list, and a partially-deleted/locked publish folder can otherwise leave the
+         loose content files (appsettings.json, etc.) missing on later publishes. -->
+    <Target Name="CleanPublishDirectoryBeforePublish" BeforeTargets="GenerateSingleFileBundle">
+      <RemoveDir Directories="$(PublishDir)" />
+    </Target>
 
 </Project>

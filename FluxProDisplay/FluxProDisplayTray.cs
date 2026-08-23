@@ -2,7 +2,6 @@ using FluxProDisplay.DTOs.AppSettings;
 using HidLibrary;
 using Microsoft.Win32;
 using Microsoft.Win32.TaskScheduler;
-using System.Text.Json;
 using Task = System.Threading.Tasks.Task;
 
 namespace FluxProDisplay;
@@ -101,13 +100,14 @@ public partial class FluxProDisplayTray : Form
             AddDebugMenuItems();
         }
 
-        // sensor selection menus
-        AddSensorSelectionMenus();
-
+        // connection status label, shown directly under the app name
         _connectionStatusLabel = new ToolStripLabel();
         _connectionStatusLabel.ForeColor = Color.Crimson;
         _connectionStatusLabel.Enabled = true;
         _contextMenuStrip.Items.Add(_connectionStatusLabel);
+
+        // sensor selection menus
+        AddSensorSelectionMenus();
 
         // menu items
         _startupToggleMenuItem = new ToolStripMenuItem();
@@ -147,9 +147,9 @@ public partial class FluxProDisplayTray : Form
         _contextMenuStrip.Items.Add(_gpuTempDebugLabel);
     }
 
-    private void AddSensorSelectionMenus()
+    private void AddSensorSelectionMenus(int insertIndex = -1)
     {
-        _contextMenuStrip.Items.Add(new ToolStripSeparator());
+        var separator = new ToolStripSeparator();
         
         // CPU Sensor Selection
         var cpuSensorMenu = new ToolStripMenuItem("CPU Sensor");
@@ -187,8 +187,18 @@ public partial class FluxProDisplayTray : Form
             gpuSensorMenu.DropDownItems.Add(item);
         }
         
-        _contextMenuStrip.Items.Add(cpuSensorMenu);
-        _contextMenuStrip.Items.Add(gpuSensorMenu);
+        if (insertIndex >= 0)
+        {
+            _contextMenuStrip.Items.Insert(insertIndex, separator);
+            _contextMenuStrip.Items.Insert(insertIndex + 1, cpuSensorMenu);
+            _contextMenuStrip.Items.Insert(insertIndex + 2, gpuSensorMenu);
+        }
+        else
+        {
+            _contextMenuStrip.Items.Add(separator);
+            _contextMenuStrip.Items.Add(cpuSensorMenu);
+            _contextMenuStrip.Items.Add(gpuSensorMenu);
+        }
     }
 
     private void RefreshSensorMenus()
@@ -212,7 +222,9 @@ public partial class FluxProDisplayTray : Form
             _contextMenuStrip.Items.RemoveAt(cpuMenuIndex);     // CPU menu
             _contextMenuStrip.Items.RemoveAt(cpuMenuIndex - 1); // Separator
             
-            AddSensorSelectionMenus();
+            // Re-insert the sensor menus at their original position (after the app
+            // name/debug labels) instead of appending them to the end of the menu.
+            AddSensorSelectionMenus(cpuMenuIndex - 1);
             SaveConfiguration();
         }
     }
@@ -221,20 +233,16 @@ public partial class FluxProDisplayTray : Form
     {
         try
         {
-            var configPath = Path.Combine(AppContext.BaseDirectory, "appsettings.json");
             var cpuName = _monitor.GetSelectedCpuSensorFullName();
             var gpuName = _monitor.GetSelectedGpuSensorFullName();
             
-            Console.WriteLine($"[SAVE] Saving to: {configPath}");
             Console.WriteLine($"[SAVE] CPU Sensor: {cpuName}");
             Console.WriteLine($"[SAVE] GPU Sensor: {gpuName}");
-            
-            _configuration.AppSettings.SelectedCpuSensor = cpuName;
-            _configuration.AppSettings.SelectedGpuSensor = gpuName;
-            
-            var options = new JsonSerializerOptions { WriteIndented = true };
-            var json = JsonSerializer.Serialize(_configuration, options);
-            File.WriteAllText(configPath, json);
+
+            // Persist to the per-user settings file rather than next to the executable.
+            // The exe folder is not reliably writable (e.g. installed under Program Files)
+            // and appsettings.json gets overwritten on every rebuild/publish.
+            UserSettingsStore.Save(cpuName, gpuName);
             
             Console.WriteLine("[SAVE] Configuration saved successfully");
         }

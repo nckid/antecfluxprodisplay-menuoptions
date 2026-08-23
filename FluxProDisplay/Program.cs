@@ -54,6 +54,15 @@ internal static class Program
                     Environment.Exit(1);
                 }
 
+                // Overlay persisted user preferences (sensor selection). These live in
+                // %APPDATA% and are authoritative for choices the user makes at runtime,
+                // so they survive rebuilds, re-installs, and reboots.
+                var (userCpuSensor, userGpuSensor) = UserSettingsStore.Load();
+                if (!string.IsNullOrEmpty(userCpuSensor))
+                    rootConfig.AppSettings.SelectedCpuSensor = userCpuSensor;
+                if (!string.IsNullOrEmpty(userGpuSensor))
+                    rootConfig.AppSettings.SelectedGpuSensor = userGpuSensor;
+
                 ApplicationConfiguration.Initialize();
                 Application.Run(new FluxProDisplayTray(rootConfig!));
             }

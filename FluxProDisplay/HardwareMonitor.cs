@@ -7,10 +7,10 @@ public class HardwareMonitor : IDisposable
 {
     private readonly object _syncRoot = new();
     private readonly Computer _computer;
-    private readonly string? _savedCpuSensorName;
-    private readonly string? _savedCpuHardwareName;
-    private readonly string? _savedGpuSensorName;
-    private readonly string? _savedGpuHardwareName;
+    private string? _savedCpuSensorName;
+    private string? _savedCpuHardwareName;
+    private string? _savedGpuSensorName;
+    private string? _savedGpuHardwareName;
     private IHardware? _cpuHardware;
     private ISensor? _cpuSensor;
     private IHardware? _gpuHardware;
@@ -59,6 +59,8 @@ public class HardwareMonitor : IDisposable
         lock (_syncRoot)
         {
             if (_cpuSensor == null) ResolveCpuSensor();
+            else TryRestoreSavedCpuSensor();
+
             cpuHardware = _cpuHardware;
             cpuSensor = _cpuSensor;
         }
@@ -78,6 +80,8 @@ public class HardwareMonitor : IDisposable
         lock (_syncRoot)
         {
             if (_gpuSensor == null) ResolveGpuSensor();
+            else TryRestoreSavedGpuSensor();
+
             gpuHardware = _gpuHardware;
             gpuSensor = _gpuSensor;
         }
@@ -106,37 +110,50 @@ public class HardwareMonitor : IDisposable
         var logMsg = $"[RESOLVE-CPU] Saved hardware: '{_savedCpuHardwareName}', sensor: '{_savedCpuSensorName}'";
         Console.WriteLine(logMsg);
         LogDebug(logMsg);
-        
+
+        // Refresh all CPU hardware so the sensor lists are as complete as possible.
+        foreach (var hardware in _computer.Hardware)
+        {
+            if (hardware.HardwareType == HardwareType.Cpu)
+                hardware.Update();
+        }
+
+        // 1) Exact match against the saved selection, across all CPU hardware.
+        if (_savedCpuSensorName != null)
+        {
+            foreach (var hardware in _computer.Hardware)
+            {
+                if (hardware.HardwareType != HardwareType.Cpu) continue;
+
+                foreach (var sensor in hardware.Sensors)
+                {
+                    if (sensor.SensorType != SensorType.Temperature) continue;
+
+                    if (sensor.Name.Equals(_savedCpuSensorName, StringComparison.OrdinalIgnoreCase) &&
+                        (_savedCpuHardwareName == null || hardware.Name.Equals(_savedCpuHardwareName, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        logMsg = $"[RESOLVE-CPU]   ✓ MATCHED saved sensor: {hardware.Name}:{sensor.Name}";
+                        Console.WriteLine(logMsg);
+                        LogDebug(logMsg);
+                        _cpuHardware = hardware;
+                        _cpuSensor = sensor;
+                        return;
+                    }
+                }
+            }
+            logMsg = "[RESOLVE-CPU]   Saved sensor not found; trying defaults";
+            Console.WriteLine(logMsg);
+            LogDebug(logMsg);
+        }
+
+        // 2) Preferred sensor.
         foreach (var hardware in _computer.Hardware)
         {
             if (hardware.HardwareType != HardwareType.Cpu) continue;
 
-            hardware.Update();
-            logMsg = $"[RESOLVE-CPU] Found CPU hardware: '{hardware.Name}'";
-            Console.WriteLine(logMsg);
-            LogDebug(logMsg);
-
-            ISensor? firstTempSensor = null;
             foreach (var sensor in hardware.Sensors)
             {
                 if (sensor.SensorType != SensorType.Temperature) continue;
-
-                logMsg = $"[RESOLVE-CPU]   - Sensor: '{sensor.Name}'";
-                Console.WriteLine(logMsg);
-                LogDebug(logMsg);
-
-                // Check for saved sensor name first
-                if (_savedCpuSensorName != null && 
-                    sensor.Name.Equals(_savedCpuSensorName, StringComparison.OrdinalIgnoreCase) &&
-                    (_savedCpuHardwareName == null || hardware.Name.Equals(_savedCpuHardwareName, StringComparison.OrdinalIgnoreCase)))
-                {
-                    logMsg = $"[RESOLVE-CPU]   ✓ MATCHED saved sensor: {hardware.Name}:{sensor.Name}";
-                    Console.WriteLine(logMsg);
-                    LogDebug(logMsg);
-                    _cpuHardware = hardware;
-                    _cpuSensor = sensor;
-                    return;
-                }
 
                 if (sensor.Name.Contains("Tctl/Tdie", StringComparison.OrdinalIgnoreCase) ||
                     sensor.Name.Contains("CPU Package", StringComparison.OrdinalIgnoreCase))
@@ -148,21 +165,27 @@ public class HardwareMonitor : IDisposable
                     _cpuSensor = sensor;
                     return;
                 }
-
-                firstTempSensor ??= sensor;
             }
+        }
 
-            // fall back to any CPU temperature sensor
-            if (firstTempSensor != null)
+        // 3) Fall back to the first CPU temperature sensor.
+        foreach (var hardware in _computer.Hardware)
+        {
+            if (hardware.HardwareType != HardwareType.Cpu) continue;
+
+            foreach (var sensor in hardware.Sensors)
             {
-                logMsg = $"[RESOLVE-CPU]   ✓ MATCHED fallback sensor: {hardware.Name}:{firstTempSensor.Name}";
+                if (sensor.SensorType != SensorType.Temperature) continue;
+
+                logMsg = $"[RESOLVE-CPU]   ✓ MATCHED fallback sensor: {hardware.Name}:{sensor.Name}";
                 Console.WriteLine(logMsg);
                 LogDebug(logMsg);
                 _cpuHardware = hardware;
-                _cpuSensor = firstTempSensor;
+                _cpuSensor = sensor;
                 return;
             }
         }
+
         logMsg = "[RESOLVE-CPU] No CPU sensor found";
         Console.WriteLine(logMsg);
         LogDebug(logMsg);
@@ -173,36 +196,50 @@ public class HardwareMonitor : IDisposable
         var logMsg = $"[RESOLVE-GPU] Saved hardware: '{_savedGpuHardwareName}', sensor: '{_savedGpuSensorName}'";
         Console.WriteLine(logMsg);
         LogDebug(logMsg);
-        
+
+        // Refresh all GPU hardware so the sensor lists are as complete as possible.
+        foreach (var hardware in _computer.Hardware)
+        {
+            if (hardware.HardwareType is HardwareType.GpuNvidia or HardwareType.GpuAmd or HardwareType.GpuIntel)
+                hardware.Update();
+        }
+
+        // 1) Exact match against the saved selection, across all GPU hardware.
+        if (_savedGpuSensorName != null)
+        {
+            foreach (var hardware in _computer.Hardware)
+            {
+                if (hardware.HardwareType is not (HardwareType.GpuNvidia or HardwareType.GpuAmd or HardwareType.GpuIntel)) continue;
+
+                foreach (var sensor in hardware.Sensors)
+                {
+                    if (sensor.SensorType != SensorType.Temperature) continue;
+
+                    if (sensor.Name.Equals(_savedGpuSensorName, StringComparison.OrdinalIgnoreCase) &&
+                        (_savedGpuHardwareName == null || hardware.Name.Equals(_savedGpuHardwareName, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        logMsg = $"[RESOLVE-GPU]   ✓ MATCHED saved sensor: {hardware.Name}:{sensor.Name}";
+                        Console.WriteLine(logMsg);
+                        LogDebug(logMsg);
+                        _gpuHardware = hardware;
+                        _gpuSensor = sensor;
+                        return;
+                    }
+                }
+            }
+            logMsg = "[RESOLVE-GPU]   Saved sensor not found; trying defaults";
+            Console.WriteLine(logMsg);
+            LogDebug(logMsg);
+        }
+
+        // 2) Preferred sensor.
         foreach (var hardware in _computer.Hardware)
         {
             if (hardware.HardwareType is not (HardwareType.GpuNvidia or HardwareType.GpuAmd or HardwareType.GpuIntel)) continue;
 
-            hardware.Update();
-            logMsg = $"[RESOLVE-GPU] Found GPU hardware: '{hardware.Name}'";
-            Console.WriteLine(logMsg);
-            LogDebug(logMsg);
-
             foreach (var sensor in hardware.Sensors)
             {
                 if (sensor.SensorType != SensorType.Temperature) continue;
-
-                logMsg = $"[RESOLVE-GPU]   - Sensor: '{sensor.Name}'";
-                Console.WriteLine(logMsg);
-                LogDebug(logMsg);
-
-                // Check for saved sensor name first
-                if (_savedGpuSensorName != null && 
-                    sensor.Name.Equals(_savedGpuSensorName, StringComparison.OrdinalIgnoreCase) &&
-                    (_savedGpuHardwareName == null || hardware.Name.Equals(_savedGpuHardwareName, StringComparison.OrdinalIgnoreCase)))
-                {
-                    logMsg = $"[RESOLVE-GPU]   ✓ MATCHED saved sensor: {hardware.Name}:{sensor.Name}";
-                    Console.WriteLine(logMsg);
-                    LogDebug(logMsg);
-                    _gpuHardware = hardware;
-                    _gpuSensor = sensor;
-                    return;
-                }
 
                 if (sensor.Name.Contains("GPU Core", StringComparison.OrdinalIgnoreCase))
                 {
@@ -215,6 +252,25 @@ public class HardwareMonitor : IDisposable
                 }
             }
         }
+
+        // 3) Fall back to the first GPU temperature sensor.
+        foreach (var hardware in _computer.Hardware)
+        {
+            if (hardware.HardwareType is not (HardwareType.GpuNvidia or HardwareType.GpuAmd or HardwareType.GpuIntel)) continue;
+
+            foreach (var sensor in hardware.Sensors)
+            {
+                if (sensor.SensorType != SensorType.Temperature) continue;
+
+                logMsg = $"[RESOLVE-GPU]   ✓ MATCHED fallback sensor: {hardware.Name}:{sensor.Name}";
+                Console.WriteLine(logMsg);
+                LogDebug(logMsg);
+                _gpuHardware = hardware;
+                _gpuSensor = sensor;
+                return;
+            }
+        }
+
         logMsg = "[RESOLVE-GPU] No GPU sensor found";
         Console.WriteLine(logMsg);
         LogDebug(logMsg);
@@ -269,6 +325,9 @@ public class HardwareMonitor : IDisposable
                 {
                     _cpuHardware = hardware;
                     _cpuSensor = sensor;
+                    // Remember the new selection so it can be restored on later runs.
+                    _savedCpuHardwareName = hardware.Name;
+                    _savedCpuSensorName = sensor.Name;
                     return;
                 }
             }
@@ -283,6 +342,63 @@ public class HardwareMonitor : IDisposable
             {
                 if (hardware.Sensors.Contains(sensor))
                 {
+                    _gpuHardware = hardware;
+                    _gpuSensor = sensor;
+                    // Remember the new selection so it can be restored on later runs.
+                    _savedGpuHardwareName = hardware.Name;
+                    _savedGpuSensorName = sensor.Name;
+                    return;
+                }
+            }
+        }
+    }
+
+    private void TryRestoreSavedCpuSensor()
+    {
+        // Nothing saved, or already on the saved sensor.
+        if (_savedCpuSensorName == null || _cpuSensor == null) return;
+        if (_cpuSensor.Name.Equals(_savedCpuSensorName, StringComparison.OrdinalIgnoreCase)) return;
+
+        // Some sensors (e.g. AMD "CCDs Average (Tdie)") only appear after the first few
+        // update cycles, so keep scanning until the saved sensor becomes available.
+        foreach (var hardware in _computer.Hardware)
+        {
+            if (hardware.HardwareType != HardwareType.Cpu) continue;
+
+            foreach (var sensor in hardware.Sensors)
+            {
+                if (sensor.SensorType != SensorType.Temperature) continue;
+
+                if (sensor.Name.Equals(_savedCpuSensorName, StringComparison.OrdinalIgnoreCase) &&
+                    (_savedCpuHardwareName == null || hardware.Name.Equals(_savedCpuHardwareName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    LogDebug($"[RESTORE-CPU] ✓ Restored saved sensor: {hardware.Name}:{sensor.Name}");
+                    _cpuHardware = hardware;
+                    _cpuSensor = sensor;
+                    return;
+                }
+            }
+        }
+    }
+
+    private void TryRestoreSavedGpuSensor()
+    {// Nothing saved, or already on the saved sensor.
+        
+        if (_savedGpuSensorName == null || _gpuSensor == null) return;
+        if (_gpuSensor.Name.Equals(_savedGpuSensorName, StringComparison.OrdinalIgnoreCase)) return;
+
+        foreach (var hardware in _computer.Hardware)
+        {
+            if (hardware.HardwareType is not (HardwareType.GpuNvidia or HardwareType.GpuAmd or HardwareType.GpuIntel)) continue;
+
+            foreach (var sensor in hardware.Sensors)
+            {
+                if (sensor.SensorType != SensorType.Temperature) continue;
+
+                if (sensor.Name.Equals(_savedGpuSensorName, StringComparison.OrdinalIgnoreCase) &&
+                    (_savedGpuHardwareName == null || hardware.Name.Equals(_savedGpuHardwareName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    LogDebug($"[RESTORE-GPU] ✓ Restored saved sensor: {hardware.Name}:{sensor.Name}");
                     _gpuHardware = hardware;
                     _gpuSensor = sensor;
                     return;
