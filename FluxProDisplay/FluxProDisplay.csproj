@@ -17,29 +17,34 @@
       <PackageReference Include="Microsoft.Extensions.Configuration" Version="10.0.0" />
       <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="10.0.0" />
       <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="10.0.0" />
-      <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.7-pre717" />
-      <PackageReference Include="Microsoft.NET.ILLink.Tasks" Version="10.0.10" />
+      <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.6" />
       <PackageReference Include="TaskScheduler" Version="2.12.2" />
     </ItemGroup>
 
     <ItemGroup>
       <None Update="app.manifest">
         <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       </None>
       <None Update="Assets\app_icon.ico">
         <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       </None>
       <None Update="Assets\icon_connected.ico">
         <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       </None>
       <None Update="Assets\icon_disconnected.ico">
         <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       </None>
       <None Update="appsettings.json">
         <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       </None>
       <None Update="NuGet.Config">
         <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       </None>
     </ItemGroup>
 
@@ -50,6 +55,7 @@
     <ItemGroup>
       <EmbeddedResource Include="Assets\PawnIO_setup.exe">
         <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
       </EmbeddedResource>
     </ItemGroup>
 

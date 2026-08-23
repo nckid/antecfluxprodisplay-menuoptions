@@ -1,6 +1,8 @@
 using FluxProDisplay.DTOs.AppSettings;
 using HidLibrary;
+using Microsoft.Win32;
 using Microsoft.Win32.TaskScheduler;
+using System.Text.Json;
 using Task = System.Threading.Tasks.Task;
 
 namespace FluxProDisplay;
@@ -8,6 +10,7 @@ namespace FluxProDisplay;
 public partial class FluxProDisplayTray : Form
 {
     private readonly HardwareMonitor _monitor;
+    private readonly RootConfig _configuration;
     private ToolStripLabel? _connectionStatusLabel;
     private ToolStripLabel? _cpuTempDebugLabel;
     private ToolStripLabel? _gpuTempDebugLabel;
@@ -28,6 +31,20 @@ public partial class FluxProDisplayTray : Form
     private HidDevice? _device;
     private byte[]? _payload;
 
+    // reconnect state (accessed only from the update loop thread)
+    private int _consecutiveWriteFailures;
+    private DateTime _nextReconnectAttemptUtc = DateTime.MinValue;
+
+    // last good/displayed temperatures
+    private float _lastCpuTemp;
+    private float _lastGpuTemp;
+
+    // last connection state pushed to the UI
+    private bool? _lastReportedConnected;
+
+    // set by the power-mode event handler when the system resumes from sleep
+    private volatile bool _resumeDetected;
+
     private readonly Icon _iconConnected = new Icon(Path.Combine(AppContext.BaseDirectory, "Assets", "icon_connected.ico"));
     private readonly Icon _iconDisconnected = new Icon(Path.Combine(AppContext.BaseDirectory, "Assets", "icon_disconnected.ico"));
     
@@ -41,7 +58,14 @@ public partial class FluxProDisplayTray : Form
         
         InitializeComponent();
         
-        _monitor = new HardwareMonitor();
+        _configuration = configuration;
+        _monitor = new HardwareMonitor(configuration.AppSettings);
+        
+        // Resolve sensors using saved configuration before setting up UI
+        _monitor.GetCpuTemperature();
+        _monitor.GetGpuTemperature();
+        
+        Console.WriteLine($"After resolve: CPU={_monitor.GetSelectedCpuSensorName()}, GPU={_monitor.GetSelectedGpuSensorName()}");
         
         // initialize variables from config file for easier changing
         _debug = configuration.AppInfo.Debug;
@@ -50,6 +74,9 @@ public partial class FluxProDisplayTray : Form
         _productId = configuration.AppSettings.ProductIdInt;
         
         SetUpTrayIcon();
+
+        // proactively drop the stale HID handle when the machine wakes from sleep
+        SystemEvents.PowerModeChanged += OnPowerModeChanged;
 
         _ = WriteToDisplay().ContinueWith(
             t => Logger.LogError(t.Exception!),
@@ -74,7 +101,8 @@ public partial class FluxProDisplayTray : Form
             AddDebugMenuItems();
         }
 
-        _contextMenuStrip.Items.Add(new ToolStripSeparator());
+        // sensor selection menus
+        AddSensorSelectionMenus();
 
         _connectionStatusLabel = new ToolStripLabel();
         _connectionStatusLabel.ForeColor = Color.Crimson;
@@ -119,6 +147,104 @@ public partial class FluxProDisplayTray : Form
         _contextMenuStrip.Items.Add(_gpuTempDebugLabel);
     }
 
+    private void AddSensorSelectionMenus()
+    {
+        _contextMenuStrip.Items.Add(new ToolStripSeparator());
+        
+        // CPU Sensor Selection
+        var cpuSensorMenu = new ToolStripMenuItem("CPU Sensor");
+        var cpuSensors = _monitor.GetAvailableCpuSensors();
+        var selectedCpuSensor = _monitor.GetSelectedCpuSensorName();
+        
+        foreach (var (name, sensor) in cpuSensors)
+        {
+            var item = new ToolStripMenuItem(name);
+            item.Checked = (name == selectedCpuSensor);
+            var capturedSensor = sensor;
+            item.Click += (s, e) =>
+            {
+                _monitor.SetCpuSensor(capturedSensor);
+                RefreshSensorMenus();
+            };
+            cpuSensorMenu.DropDownItems.Add(item);
+        }
+        
+        // GPU Sensor Selection
+        var gpuSensorMenu = new ToolStripMenuItem("GPU Sensor");
+        var gpuSensors = _monitor.GetAvailableGpuSensors();
+        var selectedGpuSensor = _monitor.GetSelectedGpuSensorName();
+        
+        foreach (var (name, sensor) in gpuSensors)
+        {
+            var item = new ToolStripMenuItem(name);
+            item.Checked = (name == selectedGpuSensor);
+            var capturedSensor = sensor;
+            item.Click += (s, e) =>
+            {
+                _monitor.SetGpuSensor(capturedSensor);
+                RefreshSensorMenus();
+            };
+            gpuSensorMenu.DropDownItems.Add(item);
+        }
+        
+        _contextMenuStrip.Items.Add(cpuSensorMenu);
+        _contextMenuStrip.Items.Add(gpuSensorMenu);
+    }
+
+    private void RefreshSensorMenus()
+    {
+        // Find and remove the sensor menus and separator
+        var cpuMenuIndex = -1;
+        
+        for (int i = _contextMenuStrip.Items.Count - 1; i >= 0; i--)
+        {
+            if (_contextMenuStrip.Items[i] is ToolStripMenuItem mi && mi.Text == "CPU Sensor")
+            {
+                cpuMenuIndex = i;
+                break;
+            }
+        }
+        
+        if (cpuMenuIndex > 0)
+        {
+            // Remove GPU Sensor menu, CPU Sensor menu, and separator
+            _contextMenuStrip.Items.RemoveAt(cpuMenuIndex + 1); // GPU menu
+            _contextMenuStrip.Items.RemoveAt(cpuMenuIndex);     // CPU menu
+            _contextMenuStrip.Items.RemoveAt(cpuMenuIndex - 1); // Separator
+            
+            AddSensorSelectionMenus();
+            SaveConfiguration();
+        }
+    }
+
+    private void SaveConfiguration()
+    {
+        try
+        {
+            var configPath = Path.Combine(AppContext.BaseDirectory, "appsettings.json");
+            var cpuName = _monitor.GetSelectedCpuSensorFullName();
+            var gpuName = _monitor.GetSelectedGpuSensorFullName();
+            
+            Console.WriteLine($"[SAVE] Saving to: {configPath}");
+            Console.WriteLine($"[SAVE] CPU Sensor: {cpuName}");
+            Console.WriteLine($"[SAVE] GPU Sensor: {gpuName}");
+            
+            _configuration.AppSettings.SelectedCpuSensor = cpuName;
+            _configuration.AppSettings.SelectedGpuSensor = gpuName;
+            
+            var options = new JsonSerializerOptions { WriteIndented = true };
+            var json = JsonSerializer.Serialize(_configuration, options);
+            File.WriteAllText(configPath, json);
+            
+            Console.WriteLine("[SAVE] Configuration saved successfully");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[SAVE] Error: {ex}");
+            Logger.LogError(new Exception("Failed to save configuration", ex));
+        }
+    }
+
     private void StartupToggleMenuItemClicked(object? sender, EventArgs e)
     {
         var exePath = Application.ExecutablePath;
@@ -161,10 +287,17 @@ public partial class FluxProDisplayTray : Form
         Application.Exit();
     }
 
+    private void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
+    {
+        if (e.Mode == PowerModes.Resume)
+            _resumeDetected = true;
+    }
+
     protected override void Dispose(bool disposing)
     {
         if (disposing)
         {
+            SystemEvents.PowerModeChanged -= OnPowerModeChanged;
             _pollTimer?.Dispose();
             _device?.Dispose();
             _monitor.Dispose();
@@ -196,21 +329,38 @@ public partial class FluxProDisplayTray : Form
         {
             try
             {
-                // sample once per tick and reuse for both payload and debug labels
-                var cpuTemp = _monitor.GetCpuTemperature();
-                var gpuTemp = _monitor.GetGpuTemperature();
-
-                // drop a stale handle (unplug, sleep/resume) so we re-enumerate
-                if (_device is { IsConnected: false })
+                // system resumed from sleep: drop the stale handle and reconnect immediately
+                if (_resumeDetected)
                 {
-                    _device.Dispose();
-                    _device = null;
+                    _resumeDetected = false;
+                    ForceReconnect();
                 }
 
-                if (_device == null)
+                // sample once per tick and reuse for both payload and debug labels
+                var cpuTempRaw = _monitor.GetCpuTemperature();
+                var gpuTempRaw = _monitor.GetGpuTemperature();
+
+                // hold the last good reading whenever a sensor reports an invalid value
+                var cpuTemp = SanitizeTemperature(cpuTempRaw, _lastCpuTemp);
+                var gpuTemp = SanitizeTemperature(gpuTempRaw, _lastGpuTemp);
+                _lastCpuTemp = cpuTemp;
+                _lastGpuTemp = gpuTemp;
+
+                // (re)connect only when due; health is judged by write success, not enumeration
+                if (_device == null && DateTime.UtcNow >= _nextReconnectAttemptUtc)
                 {
                     _device = HidDevices.Enumerate(_vendorId, _productId).FirstOrDefault();
-                    _payload = null;
+                    if (_device == null)
+                    {
+                        // device still missing: back off so we don't hammer the HID subsystem
+                        ScheduleReconnect();
+                        LogConnection("Device not found; scheduling reconnect");
+                    }
+                    else
+                    {
+                        _payload = null;
+                        LogConnection("Device connected");
+                    }
                 }
 
                 if (_device != null)
@@ -228,34 +378,42 @@ public partial class FluxProDisplayTray : Form
                         _payload[5] = 6;
                     }
 
+                    // write every tick: the panel treats these reports as a keep-alive
+                    // heartbeat, so gaps in writes let the display go to sleep (flicker)
+                    FillPayload(_payload, cpuTemp, gpuTemp);
+
+                    var ok = false;
                     try
                     {
-                        FillPayload(_payload, cpuTemp, gpuTemp);
-                        _device.Write(_payload);
-                        _connectionStatusLabel!.Text = "Connected";
-                        _appStatusNotifyIcon.Icon = _iconConnected;
-                        _connectionStatusLabel.ForeColor = Color.Green;
+                        // Write returns false on failure instead of throwing in most cases
+                        ok = _device.Write(_payload);
                     }
                     catch
                     {
-                        // write failed: drop the handle and fall through to reconnect next tick
-                        _device.Dispose();
-                        _device = null;
-                        _payload = null;
+                        ok = false;
+                    }
+
+                    if (ok)
+                    {
+                        _consecutiveWriteFailures = 0;
+                    }
+                    else
+                    {
+                        DropDevice();
                     }
                 }
 
-                if (_device == null)
+                // update tray/status UI (marshaled onto the UI thread)
+                var connected = _device != null;
+                if (_lastReportedConnected != connected)
                 {
-                    _connectionStatusLabel!.Text = "Not Connected";
-                    _appStatusNotifyIcon.Icon = _iconDisconnected;
-                    _connectionStatusLabel.ForeColor = Color.Crimson;
+                    _lastReportedConnected = connected;
+                    SetConnectionStatus(connected);
                 }
 
                 if (_debug)
                 {
-                    _cpuTempDebugLabel!.Text = "CPU Temp: " + Math.Round(cpuTemp ?? 0, 1) + "°C";
-                    _gpuTempDebugLabel!.Text = "GPU Temp: " + Math.Round(gpuTemp ?? 0, 1) + "°C";
+                    UpdateDebugLabels(cpuTempRaw, gpuTempRaw);
                 }
             }
             catch (Exception ex)
@@ -264,6 +422,122 @@ public partial class FluxProDisplayTray : Form
                 Logger.LogError(ex);
             }
         } while (await _pollTimer.WaitForNextTickAsync());
+    }
+
+    /// <summary>
+    /// Updates the connection status label and tray icon on the UI thread.
+    /// </summary>
+    private void SetConnectionStatus(bool connected)
+    {
+        if (IsDisposed)
+            return;
+
+        if (InvokeRequired)
+        {
+            BeginInvoke(new System.Action(() => SetConnectionStatus(connected)));
+            return;
+        }
+
+        if (_connectionStatusLabel == null || _appStatusNotifyIcon == null)
+            return;
+
+        _connectionStatusLabel.Text = connected ? "Connected" : "Not Connected";
+        _appStatusNotifyIcon.Icon = connected ? _iconConnected : _iconDisconnected;
+        _connectionStatusLabel.ForeColor = connected ? Color.Green : Color.Crimson;
+    }
+
+    /// <summary>
+    /// Updates the debug temperature labels on the UI thread.
+    /// </summary>
+    private void UpdateDebugLabels(float? cpuTemp, float? gpuTemp)
+    {
+        if (IsDisposed)
+            return;
+
+        if (InvokeRequired)
+        {
+            BeginInvoke(new System.Action(() => UpdateDebugLabels(cpuTemp, gpuTemp)));
+            return;
+        }
+
+        if (_cpuTempDebugLabel == null || _gpuTempDebugLabel == null)
+            return;
+
+        _cpuTempDebugLabel.Text = "CPU Temp: " + FormatDebugTemp(cpuTemp) + "°C";
+        _gpuTempDebugLabel.Text = "GPU Temp: " + FormatDebugTemp(gpuTemp) + "°C";
+    }
+
+    private static string FormatDebugTemp(float? value)
+    {
+        if (value is null || float.IsNaN(value.Value) || float.IsInfinity(value.Value))
+            return "N/A";
+
+        return Math.Round(value.Value, 1).ToString("0.0");
+    }
+
+    /// <summary>
+    /// Drops the current device handle and schedules a reconnect attempt with backoff.
+    /// </summary>
+    private void DropDevice()
+    {
+        _device?.Dispose();
+        _device = null;
+        _payload = null;
+        LogConnection($"Write failed; dropping device (failure #{_consecutiveWriteFailures + 1})");
+        ScheduleReconnect();
+    }
+
+    /// <summary>
+    /// Drops the current device handle and reconnects immediately on the next tick.
+    /// </summary>
+    private void ForceReconnect()
+    {
+        _device?.Dispose();
+        _device = null;
+        _payload = null;
+        _consecutiveWriteFailures = 0;
+        _nextReconnectAttemptUtc = DateTime.MinValue;
+        LogConnection("System resumed from sleep; forcing reconnect");
+    }
+
+    /// <summary>
+    /// Schedules the next reconnect attempt using exponential backoff.
+    /// </summary>
+    private void ScheduleReconnect()
+    {
+        _consecutiveWriteFailures++;
+        var exponent = Math.Min(_consecutiveWriteFailures, 6);
+        var delayMs = Math.Min(500 * (int)Math.Pow(2, exponent), 30_000);
+        _nextReconnectAttemptUtc = DateTime.UtcNow.AddMilliseconds(delayMs);
+    }
+
+    /// <summary>
+    /// Writes a timestamped connection event to the app's log directory.
+    /// </summary>
+    private static void LogConnection(string message)
+    {
+        try
+        {
+            var logDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "FluxProDisplay");
+            Directory.CreateDirectory(logDir);
+            File.AppendAllText(Path.Combine(logDir, "connection.log"), $"[{DateTime.Now:O}] {message}{Environment.NewLine}");
+        }
+        catch
+        {
+            // logging must never crash the app
+        }
+    }
+
+    /// <summary>
+    /// Returns a valid, displayable temperature, holding the last good value when a
+    /// sensor reports null, NaN, infinite or negative values.
+    /// </summary>
+    private static float SanitizeTemperature(float? value, float lastGood)
+    {
+        if (value is null || float.IsNaN(value.Value) || float.IsInfinity(value.Value) || value.Value < 0f)
+            return lastGood;
+
+        return Math.Clamp(value.Value, 0f, 99.9f);
     }
 
     /// <summary>

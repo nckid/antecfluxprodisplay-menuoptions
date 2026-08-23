@@ -35,6 +35,14 @@ internal static class Program
                     .Build();
 
                 var rootConfig = configuration.Get<RootConfig>();
+                Console.WriteLine($"[CONFIG] Loaded from: {AppContext.BaseDirectory}");
+                Console.WriteLine($"[CONFIG] CPU Sensor: {rootConfig?.AppSettings?.SelectedCpuSensor ?? "NULL"}");
+                Console.WriteLine($"[CONFIG] GPU Sensor: {rootConfig?.AppSettings?.SelectedGpuSensor ?? "NULL"}");
+                
+                // Also log to file
+                var logDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "FluxProDisplay");
+                Directory.CreateDirectory(logDir);
+                File.AppendAllText(Path.Combine(logDir, "debug.log"), $"[PROGRAM.CS] Loaded CPU: {rootConfig?.AppSettings?.SelectedCpuSensor}, GPU: {rootConfig?.AppSettings?.SelectedGpuSensor}\n");
 
                 if (rootConfig?.AppInfo == null || rootConfig.AppSettings == null)
                 {

@@ -5,6 +5,8 @@ public class AppSettings
     public int PollingInterval { get; set; }
     public string VendorId { get; set; } = null!;
     public string ProductId { get; set; } = null!;
+    public string? SelectedCpuSensor { get; set; }
+    public string? SelectedGpuSensor { get; set; }
     public int VendorIdInt => ParseHexString(VendorId);
     public int ProductIdInt => ParseHexString(ProductId);
 
