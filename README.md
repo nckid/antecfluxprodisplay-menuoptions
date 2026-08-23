@@ -10,6 +10,18 @@ Requires Administrator privileges in order to fetch CPU and GPU data from libre 
 3. That is it! The app will appear on the bottom right in the [system tray](https://dsurf.net/images/W11-HiddenIcons01-B.png) area.
 
 ## Notes and Information
+### CPU / GPU Sensor Selection
+Right-click the tray icon to choose which temperature sensor is shown on the display:
+
+- **CPU Sensor** — lists every CPU temperature sensor LibreHardwareMonitor finds (e.g. `CPU Package`, `Tctl/Tdie`, `Core Max`, etc.). The active sensor is shown with a checkmark.
+- **GPU Sensor** — lists every GPU temperature sensor (e.g. `GPU Core`, `GPU Hot Spot`, etc.), with the active one checked.
+
+Selecting an entry switches the display to that sensor immediately and saves your choice to `appsettings.json` (as `SelectedCpuSensor` / `SelectedGpuSensor`), so it's remembered the next time the app starts.
+
+If no sensor has been chosen yet, the app picks a default: the CPU sensor named `Tctl/Tdie` or `CPU Package`, and the GPU sensor named `GPU Core`, falling back to the first available temperature sensor if those are not present.
+
+> Sensor names come from your hardware and may vary by CPU/GPU vendor and driver version. If a saved sensor is no longer found on startup (for example, after a hardware or driver change), the app falls back to the defaults above.
+
 ### Dependencies
 - [**LibreHardwareMonitor**](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor): This project uses LibreHardwareMonitor, the latest nightly release since it gets updated frequently to support the latest CPU and GPUs.
 - [**PawnIO**](https://github.com/namazso/PawnIO): LibreHardwareMonitor uses the open-source PawnIO driver in order to fetch CPU temperatures. The reason being that before, LHM would use something called WinRing0 in order to fetch this data. However, WinRing0 has been found to open up your system to vulnerabilities with the way it accesses this data. More information can be found [here](https://support.microsoft.com/en-us/windows/microsoft-defender-antivirus-alert-vulnerabledriver-winnt-winring0-eb057830-d77b-41a2-9a34-015a5d203c42).
