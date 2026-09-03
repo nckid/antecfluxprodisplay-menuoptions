@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using FluxProDisplay.DTOs.AppSettings;
 using HidLibrary;
 using Microsoft.Win32;
@@ -22,6 +23,15 @@ public partial class FluxProDisplayTray : Form
     private readonly int _vendorId;
     private readonly int _productId;
 
+    // A single HID report must never be allowed to block the heartbeat loop:
+    // writes run overlapped and are abandoned after this many milliseconds.
+    private const int WriteTimeoutMs = 300;
+
+    // Consecutive failed writes tolerated before the device handle is recycled.
+    // A single rejected report is usually just transient USB contention, so the
+    // same handle is retried first instead of reconnecting.
+    private const int MaxConsecutiveWriteFailures = 3;
+
     // other UI components for the tab
     private NotifyIcon _appStatusNotifyIcon = null!;
     private ContextMenuStrip _contextMenuStrip = null!;
@@ -30,13 +40,14 @@ public partial class FluxProDisplayTray : Form
     private HidDevice? _device;
     private byte[]? _payload;
 
-    // reconnect state (accessed only from the update loop thread)
+    // write health (accessed only from the update loop thread)
     private int _consecutiveWriteFailures;
-    private DateTime _nextReconnectAttemptUtc = DateTime.MinValue;
+    private bool _deviceMissingLogged;
 
-    // last good/displayed temperatures
-    private float _lastCpuTemp;
-    private float _lastGpuTemp;
+    // last good/displayed temperatures (written by the sensor refresh task and
+    // read by the heartbeat loop, so they must be volatile)
+    private volatile float _lastCpuTemp;
+    private volatile float _lastGpuTemp;
 
     // last connection state pushed to the UI
     private bool? _lastReportedConnected;
@@ -328,10 +339,22 @@ public partial class FluxProDisplayTray : Form
         base.SetVisibleCore(value);
     }
 
+    /// <summary>
+    /// Main heartbeat loop. Writes a keep-alive report to the display panel every
+    /// polling tick using the last known temperatures, then refreshes sensor
+    /// readings in the background. Sensor latency and USB write stalls are kept
+    /// off the critical path so the panel never goes without a heartbeat (the
+    /// panel flickers whenever writes are delayed or fail).
+    /// </summary>
     private async Task WriteToDisplay()
     {
         // interval is in ms, set in appsettings.json
         _pollTimer = new PeriodicTimer(TimeSpan.FromMilliseconds(_pollingInterval));
+
+        // 0 = idle, 1 = sensor refresh running. Sensor reads can block for
+        // hundreds of ms (LibreHardwareMonitor hardware updates), so they run on
+        // their own task and are skipped while one is still in flight.
+        var sensorRefreshBusy = 0;
 
         do
         {
@@ -344,33 +367,31 @@ public partial class FluxProDisplayTray : Form
                     ForceReconnect();
                 }
 
-                // sample once per tick and reuse for both payload and debug labels
-                var cpuTempRaw = _monitor.GetCpuTemperature();
-                var gpuTempRaw = _monitor.GetGpuTemperature();
-
-                // hold the last good reading whenever a sensor reports an invalid value
-                var cpuTemp = SanitizeTemperature(cpuTempRaw, _lastCpuTemp);
-                var gpuTemp = SanitizeTemperature(gpuTempRaw, _lastGpuTemp);
-                _lastCpuTemp = cpuTemp;
-                _lastGpuTemp = gpuTemp;
-
-                // (re)connect only when due; health is judged by write success, not enumeration
-                if (_device == null && DateTime.UtcNow >= _nextReconnectAttemptUtc)
+                // (re)connect as soon as the device is available; health is
+                // judged by write success, not enumeration.
+                if (_device == null)
                 {
                     _device = HidDevices.Enumerate(_vendorId, _productId).FirstOrDefault();
                     if (_device == null)
                     {
-                        // device still missing: back off so we don't hammer the HID subsystem
-                        ScheduleReconnect();
-                        LogConnection("Device not found; scheduling reconnect");
+                        if (!_deviceMissingLogged)
+                        {
+                            _deviceMissingLogged = true;
+                            LogConnection("Device not found; retrying every tick");
+                        }
                     }
                     else
                     {
+                        _deviceMissingLogged = false;
                         _payload = null;
+                        _consecutiveWriteFailures = 0;
                         LogConnection("Device connected");
                     }
                 }
 
+                // Heartbeat first: write the last known temperatures before any
+                // slow work happens this tick. The panel treats these reports as
+                // a keep-alive, so delayed writes make the display flicker.
                 if (_device != null)
                 {
                     var reportLength = _device.Capabilities.OutputReportByteLength;
@@ -386,29 +407,61 @@ public partial class FluxProDisplayTray : Form
                         _payload[5] = 6;
                     }
 
-                    // write every tick: the panel treats these reports as a keep-alive
-                    // heartbeat, so gaps in writes let the display go to sleep (flicker)
-                    FillPayload(_payload, cpuTemp, gpuTemp);
+                    FillPayload(_payload, _lastCpuTemp, _lastGpuTemp);
 
-                    var ok = false;
-                    try
-                    {
-                        // Write returns false on failure instead of throwing in most cases
-                        ok = _device.Write(_payload);
-                    }
-                    catch
-                    {
-                        ok = false;
-                    }
-
-                    if (ok)
+                    var writeResult = WriteHeartbeat(_payload);
+                    if (writeResult == WriteResult.Success)
                     {
                         _consecutiveWriteFailures = 0;
                     }
+                    else if (writeResult == WriteResult.TimedOut)
+                    {
+                        // the device stopped ACKing the report; the pending
+                        // transfer has already been cancelled, so recycle the
+                        // handle and open a fresh connection next tick
+                        DropDevice("Write stalled; reconnecting");
+                    }
                     else
                     {
-                        DropDevice();
+                        _consecutiveWriteFailures++;
+                        LogConnection($"Write failed (failure #{_consecutiveWriteFailures})");
+                        if (_consecutiveWriteFailures >= MaxConsecutiveWriteFailures)
+                        {
+                            DropDevice("Write failed repeatedly; reconnecting");
+                        }
                     }
+                }
+
+                // Refresh temperatures AFTER the heartbeat so sensor latency can
+                // only affect data freshness, never the write cadence.
+                if (Interlocked.CompareExchange(ref sensorRefreshBusy, 1, 0) == 0)
+                {
+                    _ = Task.Run(() =>
+                    {
+                        try
+                        {
+                            var cpuTempRaw = _monitor.GetCpuTemperature();
+                            var gpuTempRaw = _monitor.GetGpuTemperature();
+
+                            // hold the last good reading whenever a sensor reports an invalid value
+                            _lastCpuTemp = SanitizeTemperature(cpuTempRaw, _lastCpuTemp);
+                            _lastGpuTemp = SanitizeTemperature(gpuTempRaw, _lastGpuTemp);
+
+                            if (_debug)
+                            {
+                                UpdateDebugLabels(cpuTempRaw, gpuTempRaw);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            // a bad sensor read must never kill the heartbeat loop
+                            Logger.LogError(ex);
+                        }
+                        finally
+                        {
+                            Interlocked.Exchange(ref sensorRefreshBusy, 0);
+                        }
+                    });
                 }
 
                 // update tray/status UI (marshaled onto the UI thread)
@@ -417,11 +470,6 @@ public partial class FluxProDisplayTray : Form
                 {
                     _lastReportedConnected = connected;
                     SetConnectionStatus(connected);
-                }
-
-                if (_debug)
-                {
-                    UpdateDebugLabels(cpuTempRaw, gpuTempRaw);
                 }
             }
             catch (Exception ex)
@@ -484,15 +532,16 @@ public partial class FluxProDisplayTray : Form
     }
 
     /// <summary>
-    /// Drops the current device handle and schedules a reconnect attempt with backoff.
+    /// Drops the current device handle and reconnects on the next tick.
     /// </summary>
-    private void DropDevice()
+    private void DropDevice(string reason)
     {
         _device?.Dispose();
         _device = null;
         _payload = null;
-        LogConnection($"Write failed; dropping device (failure #{_consecutiveWriteFailures + 1})");
-        ScheduleReconnect();
+        _consecutiveWriteFailures = 0;
+        _deviceMissingLogged = false;
+        LogConnection(reason);
     }
 
     /// <summary>
@@ -504,19 +553,8 @@ public partial class FluxProDisplayTray : Form
         _device = null;
         _payload = null;
         _consecutiveWriteFailures = 0;
-        _nextReconnectAttemptUtc = DateTime.MinValue;
+        _deviceMissingLogged = false;
         LogConnection("System resumed from sleep; forcing reconnect");
-    }
-
-    /// <summary>
-    /// Schedules the next reconnect attempt using exponential backoff.
-    /// </summary>
-    private void ScheduleReconnect()
-    {
-        _consecutiveWriteFailures++;
-        var exponent = Math.Min(_consecutiveWriteFailures, 6);
-        var delayMs = Math.Min(500 * (int)Math.Pow(2, exponent), 30_000);
-        _nextReconnectAttemptUtc = DateTime.UtcNow.AddMilliseconds(delayMs);
     }
 
     /// <summary>
@@ -578,5 +616,135 @@ public partial class FluxProDisplayTray : Form
         byte checksum = 0;
         for (var i = 0; i < 12; i++) checksum += payload[i];
         payload[12] = checksum;
+    }
+
+    /// <summary>
+    /// Writes one heartbeat report using an overlapped HID write bounded by
+    /// <see cref="WriteTimeoutMs"/>. A stalled device can therefore never block
+    /// the heartbeat loop, and the pending transfer is explicitly cancelled so
+    /// neither a worker thread nor an event handle can linger in the USB stack.
+    /// </summary>
+    private WriteResult WriteHeartbeat(byte[] payload)
+    {
+        var device = _device;
+        if (device == null)
+            return WriteResult.Failed;
+
+        try
+        {
+            // Overlapped write mode is required so a stalled transfer can be
+            // cancelled instead of blocking the loop indefinitely.
+            if (!device.IsOpen)
+            {
+                device.OpenDevice(DeviceMode.NonOverlapped, DeviceMode.Overlapped, ShareMode.ShareRead | ShareMode.ShareWrite);
+            }
+        }
+        catch
+        {
+            return WriteResult.Failed;
+        }
+
+        var handle = device.WriteHandle;
+        if (handle == IntPtr.Zero || handle.ToInt32() == NativeIo.InvalidHandleValue)
+            return WriteResult.Failed;
+
+        var hEvent = NativeIo.CreateEvent(IntPtr.Zero, true, false, null);
+        if (hEvent == IntPtr.Zero)
+            return WriteResult.Failed;
+
+        // keep the OVERLAPPED struct in unmanaged memory so its address is stable
+        // across the WriteFile / CancelIoEx calls (they match on that pointer)
+        var pOverlapped = Marshal.AllocHGlobal(Marshal.SizeOf<NativeOverlapped>());
+        try
+        {
+            Marshal.StructureToPtr(new NativeOverlapped { EventHandle = hEvent }, pOverlapped, false);
+
+            var started = NativeIo.WriteFile(handle, payload, (uint)payload.Length, out _, pOverlapped);
+            if (!started && Marshal.GetLastWin32Error() != NativeIo.ErrorIoPending)
+                return WriteResult.Failed;
+
+            // if the write completed synchronously the event may not be signaled,
+            // so only wait when the request was queued
+            var wait = started
+                ? NativeIo.WaitObject0
+                : NativeIo.WaitForSingleObject(hEvent, WriteTimeoutMs);
+
+            if (wait == NativeIo.WaitObject0)
+            {
+                var complete = NativeIo.GetOverlappedResult(handle, pOverlapped, out var transferred, false);
+                return complete && transferred == payload.Length
+                    ? WriteResult.Success
+                    : WriteResult.Failed;
+            }
+
+            if (wait == NativeIo.WaitFailed)
+                return WriteResult.Failed;
+
+            // still not complete: cancel this exact transfer so it cannot linger
+            // after the handle is recycled
+            NativeIo.CancelIoEx(handle, pOverlapped);
+            return WriteResult.TimedOut;
+        }
+        finally
+        {
+            // safe even after cancellation: the I/O manager holds its own
+            // reference to the event until the request finishes
+            NativeIo.CloseHandle(hEvent);
+            Marshal.FreeHGlobal(pOverlapped);
+        }
+    }
+
+    /// <summary>
+    /// Outcome of a single heartbeat write attempt.
+    /// </summary>
+    private enum WriteResult
+    {
+        /// <summary>The report was acknowledged by the device.</summary>
+        Success,
+
+        /// <summary>
+        /// The device rejected or could not accept the report. The handle is
+        /// still usable, so the next tick retries before reconnecting.
+        /// </summary>
+        Failed,
+
+        /// <summary>
+        /// The write did not complete within <see cref="WriteTimeoutMs"/> and
+        /// was cancelled. The handle is recycled and a fresh connection is made.
+        /// </summary>
+        TimedOut
+    }
+
+    /// <summary>
+    /// Minimal kernel32 declarations used for bounded, cancellable overlapped HID
+    /// writes. HidLibrary's synchronous Write can block indefinitely when a device
+    /// stops acknowledging reports.
+    /// </summary>
+    private static class NativeIo
+    {
+        // Win32 return codes / constants used by WriteHeartbeat
+        internal const uint WaitObject0 = 0;        // WAIT_OBJECT_0
+        internal const uint WaitTimeout = 258;      // WAIT_TIMEOUT
+        internal const uint WaitFailed = 0xFFFFFFFF; // WAIT_FAILED
+        internal const int ErrorIoPending = 997;    // ERROR_IO_PENDING
+        internal const int InvalidHandleValue = -1; // INVALID_HANDLE_VALUE
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern bool WriteFile(IntPtr hFile, byte[] lpBuffer, uint nNumberOfBytesToWrite, out uint lpNumberOfBytesWritten, IntPtr lpOverlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern bool CancelIoEx(IntPtr hFile, IntPtr lpOverlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern bool GetOverlappedResult(IntPtr hFile, IntPtr lpOverlapped, out uint lpNumberOfBytesTransferred, bool bWait);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern IntPtr CreateEvent(IntPtr lpEventAttributes, bool bManualReset, bool bInitialState, string? lpName);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
     }
 }
