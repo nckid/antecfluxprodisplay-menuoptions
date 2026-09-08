@@ -88,6 +88,26 @@ public partial class FluxProDisplayTray : Form
         // proactively drop the stale HID handle when the machine wakes from sleep
         SystemEvents.PowerModeChanged += OnPowerModeChanged;
 
+        // If the "Start with Windows" task exists, re-register it with the current
+        // executable path. This self-heals tasks that point at a stale location
+        // after a move/republish, and re-enables tasks that Task Scheduler
+        // disabled after failed runs.
+        try
+        {
+            using (var taskService = new TaskService())
+            {
+                if (taskService.FindTask(ElevatedTaskName) != null)
+                {
+                    RegisterStartupTask(taskService);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            // starting the app must never fail because the task refresh did
+            Logger.LogError(new Exception("Failed to refresh the startup task", ex));
+        }
+
         _ = WriteToDisplay().ContinueWith(
             t => Logger.LogError(t.Exception!),
             TaskContinuationOptions.OnlyOnFaulted);
@@ -266,8 +286,6 @@ public partial class FluxProDisplayTray : Form
 
     private void StartupToggleMenuItemClicked(object? sender, EventArgs e)
     {
-        var exePath = Application.ExecutablePath;
-
         using (var taskService = new TaskService())
         {
             var existingTask = taskService.FindTask(ElevatedTaskName);
@@ -278,20 +296,43 @@ public partial class FluxProDisplayTray : Form
             }
             else
             {
-                var newStartupTask = taskService.NewTask();
-
-                newStartupTask.RegistrationInfo.Description = "Flux Pro Display Service Task with Admin Privileges";
-                newStartupTask.Principal.RunLevel = TaskRunLevel.Highest;
-                newStartupTask.Principal.LogonType = TaskLogonType.InteractiveToken;
-
-                newStartupTask.Triggers.Add(new LogonTrigger());
-                newStartupTask.Actions.Add(new ExecAction(exePath, null, Path.GetDirectoryName(exePath)));
-
-                taskService.RootFolder.RegisterTaskDefinition(ElevatedTaskName, newStartupTask);
+                RegisterStartupTask(taskService);
             }
         }
 
         UpdateStartupMenuItemText();
+    }
+
+    /// <summary>
+    /// Registers (or refreshes) the logon task that launches this app when the
+    /// user signs in. Re-registering with CreateOrUpdate updates the action to
+    /// the current executable path and re-enables a task that Task Scheduler may
+    /// have disabled after failed runs.
+    /// </summary>
+    private void RegisterStartupTask(TaskService taskService)
+    {
+        var exePath = Application.ExecutablePath;
+
+        var startupTask = taskService.NewTask();
+        startupTask.RegistrationInfo.Description = "Flux Pro Display Service Task with Admin Privileges";
+        startupTask.Principal.RunLevel = TaskRunLevel.Highest;
+        startupTask.Principal.LogonType = TaskLogonType.InteractiveToken;
+
+        // start as soon as the scheduler can if the logon trigger is missed, and
+        // never let the default 72-hour execution limit kill a long-running task
+        startupTask.Settings.Enabled = true;
+        startupTask.Settings.StartWhenAvailable = true;
+        startupTask.Settings.ExecutionTimeLimit = TimeSpan.Zero;
+        startupTask.Settings.DisallowStartIfOnBatteries = false;
+        startupTask.Settings.MultipleInstances = TaskInstancesPolicy.IgnoreNew;
+
+        startupTask.Triggers.Add(new LogonTrigger());
+        startupTask.Actions.Add(new ExecAction(exePath, null, Path.GetDirectoryName(exePath)));
+
+        // the two-argument overload registers with CreateOrUpdate and the
+        // definition's principal (current user + InteractiveToken), so it both
+        // creates and refreshes the task
+        taskService.RootFolder.RegisterTaskDefinition(ElevatedTaskName, startupTask);
     }
 
     private void UpdateStartupMenuItemText()
