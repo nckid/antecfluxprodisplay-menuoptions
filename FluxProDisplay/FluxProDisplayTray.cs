@@ -32,6 +32,18 @@ public partial class FluxProDisplayTray : Form
     // same handle is retried first instead of reconnecting.
     private const int MaxConsecutiveWriteFailures = 3;
 
+    // Extra time allowed for a cancelled transfer to report completion before we
+    // stop waiting on it. If it still hasn't completed we deliberately leak the
+    // OVERLAPPED block rather than hand freed memory back to the kernel.
+    private const int CancelWaitMs = 500;
+
+    // How long a device lookup may run before we log that it is blocked.
+    private const int AttachStallWarningMs = 5_000;
+
+    // Safety net: if a suspend notification is never followed by a resume (an
+    // aborted sleep), writes must not stay parked indefinitely.
+    private static readonly TimeSpan MaxSuspendHold = TimeSpan.FromMinutes(3);
+
     // other UI components for the tab
     private NotifyIcon _appStatusNotifyIcon = null!;
     private ContextMenuStrip _contextMenuStrip = null!;
@@ -44,6 +56,13 @@ public partial class FluxProDisplayTray : Form
     private int _consecutiveWriteFailures;
     private bool _deviceMissingLogged;
 
+    // device attach state (accessed only from the update loop thread). The lookup
+    // runs on a worker thread: HidLibrary's enumeration opens each matching device
+    // to read its attributes, which can block for a long time on a wedged device.
+    private Task<HidDevice?>? _attachTask;
+    private DateTime _attachStartedUtc;
+    private bool _attachBlockedLogged;
+
     // last good/displayed temperatures (written by the sensor refresh task and
     // read by the heartbeat loop, so they must be volatile)
     private volatile float _lastCpuTemp;
@@ -54,6 +73,12 @@ public partial class FluxProDisplayTray : Form
 
     // set by the power-mode event handler when the system resumes from sleep
     private volatile bool _resumeDetected;
+
+    // set while the system is suspending/suspended. Writes are parked instead of
+    // cancelled in this state: cancelling a transfer during a power transition
+    // leaves the USB port in a state that can take hours to recover from.
+    private volatile bool _suspended;
+    private DateTime _suspendedSinceUtc;
 
     private readonly Icon _iconConnected = new Icon(Path.Combine(AppContext.BaseDirectory, "Assets", "icon_connected.ico"));
     private readonly Icon _iconDisconnected = new Icon(Path.Combine(AppContext.BaseDirectory, "Assets", "icon_disconnected.ico"));
@@ -349,8 +374,17 @@ public partial class FluxProDisplayTray : Form
 
     private void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
     {
-        if (e.Mode == PowerModes.Resume)
+        if (e.Mode == PowerModes.Suspend)
+        {
+            // stop issuing writes during the transition; an in-flight report that
+            // gets interrupted here must not be treated as a device failure
+            _suspendedSinceUtc = DateTime.UtcNow;
+            _suspended = true;
+        }
+        else if (e.Mode == PowerModes.Resume)
+        {
             _resumeDetected = true;
+        }
     }
 
     protected override void Dispose(bool disposing)
@@ -405,35 +439,26 @@ public partial class FluxProDisplayTray : Form
                 if (_resumeDetected)
                 {
                     _resumeDetected = false;
-                    ForceReconnect();
+                    _suspended = false;
+                    ForceReconnect("System resumed from sleep; forcing reconnect");
+                }
+                else if (_suspended && DateTime.UtcNow - _suspendedSinceUtc > MaxSuspendHold)
+                {
+                    // the resume event never arrived (aborted sleep) - drop the
+                    // handle so the parked transfer is aborted and start over
+                    _suspended = false;
+                    ForceReconnect("Suspend state timed out; reconnecting");
                 }
 
-                // (re)connect as soon as the device is available; health is
-                // judged by write success, not enumeration.
-                if (_device == null)
-                {
-                    _device = HidDevices.Enumerate(_vendorId, _productId).FirstOrDefault();
-                    if (_device == null)
-                    {
-                        if (!_deviceMissingLogged)
-                        {
-                            _deviceMissingLogged = true;
-                            LogConnection("Device not found; retrying every tick");
-                        }
-                    }
-                    else
-                    {
-                        _deviceMissingLogged = false;
-                        _payload = null;
-                        _consecutiveWriteFailures = 0;
-                        LogConnection("Device connected");
-                    }
-                }
+                // (re)connect as soon as the device is available; health is judged
+                // by write success, not enumeration. The lookup runs on a worker
+                // thread so a wedged device can never freeze the heartbeat loop.
+                HandleDeviceAttach();
 
                 // Heartbeat first: write the last known temperatures before any
                 // slow work happens this tick. The panel treats these reports as
                 // a keep-alive, so delayed writes make the display flicker.
-                if (_device != null)
+                if (_device != null && !_suspended)
                 {
                     var reportLength = _device.Capabilities.OutputReportByteLength;
                     if (_payload == null || _payload.Length != reportLength)
@@ -454,6 +479,12 @@ public partial class FluxProDisplayTray : Form
                     if (writeResult == WriteResult.Success)
                     {
                         _consecutiveWriteFailures = 0;
+                    }
+                    else if (writeResult == WriteResult.Interrupted)
+                    {
+                        // the machine started suspending mid-write: the transfer is
+                        // parked rather than cancelled, and the resume path drops
+                        // the handle cleanly, so there is nothing to recover here
                     }
                     else if (writeResult == WriteResult.TimedOut)
                     {
@@ -588,14 +619,96 @@ public partial class FluxProDisplayTray : Form
     /// <summary>
     /// Drops the current device handle and reconnects immediately on the next tick.
     /// </summary>
-    private void ForceReconnect()
+    private void ForceReconnect(string reason)
     {
         _device?.Dispose();
         _device = null;
         _payload = null;
         _consecutiveWriteFailures = 0;
         _deviceMissingLogged = false;
-        LogConnection("System resumed from sleep; forcing reconnect");
+        LogConnection(reason);
+    }
+
+    /// <summary>
+    /// Picks up a finished device lookup, or starts a new one. The lookup itself
+    /// runs on a worker thread and is never awaited here, so a wedged USB device
+    /// cannot block the heartbeat loop (previously this froze the app for hours
+    /// until the next sleep/resume cycle).
+    /// </summary>
+    private void HandleDeviceAttach()
+    {
+        if (_attachTask != null && _attachTask.IsCompleted)
+        {
+            var attached = _attachTask.Status == TaskStatus.RanToCompletion ? _attachTask.Result : null;
+            _attachTask = null;
+            _attachBlockedLogged = false;
+
+            if (attached != null)
+            {
+                if (_device == null)
+                {
+                    _device = attached;
+                    _payload = null;
+                    _consecutiveWriteFailures = 0;
+                    _deviceMissingLogged = false;
+                    LogConnection("Device connected");
+                }
+                else
+                {
+                    // a reconnect overtook this lookup; drop the extra handle
+                    attached.Dispose();
+                }
+            }
+            else if (_device == null && !_deviceMissingLogged)
+            {
+                _deviceMissingLogged = true;
+                LogConnection("Device not found; retrying");
+            }
+        }
+
+        if (_device == null && !_suspended && _attachTask == null)
+        {
+            _attachStartedUtc = DateTime.UtcNow;
+            _attachBlockedLogged = false;
+            _attachTask = Task.Run(AttachDevice);
+        }
+        else if (_attachTask != null && !_attachBlockedLogged &&
+                 DateTime.UtcNow - _attachStartedUtc > TimeSpan.FromMilliseconds(AttachStallWarningMs))
+        {
+            // HidLibrary's enumeration opens each matching device to read its
+            // attributes; on a device stuck mid-power-transition that call can sit
+            // for a long time. Keep ticking and let it finish in its own time.
+            _attachBlockedLogged = true;
+            LogConnection("Device lookup blocked; waiting for the USB stack to respond");
+        }
+    }
+
+    /// <summary>
+    /// Looks up and opens the display panel. Runs on a worker thread because the
+    /// underlying SetupAPI/HID calls can block indefinitely on a wedged device.
+    /// </summary>
+    private HidDevice? AttachDevice()
+    {
+        try
+        {
+            var device = HidDevices.Enumerate(_vendorId, _productId).FirstOrDefault();
+            if (device == null)
+                return null;
+
+            // Open in overlapped write mode so a write can be bounded, and do it
+            // here rather than in the heartbeat path, where CreateFile could block.
+            if (!device.IsOpen)
+            {
+                device.OpenDevice(DeviceMode.NonOverlapped, DeviceMode.Overlapped, ShareMode.ShareRead | ShareMode.ShareWrite);
+            }
+
+            return device;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(new Exception("Failed to attach to the display", ex));
+            return null;
+        }
     }
 
     /// <summary>
@@ -661,29 +774,17 @@ public partial class FluxProDisplayTray : Form
 
     /// <summary>
     /// Writes one heartbeat report using an overlapped HID write bounded by
-    /// <see cref="WriteTimeoutMs"/>. A stalled device can therefore never block
-    /// the heartbeat loop, and the pending transfer is explicitly cancelled so
-    /// neither a worker thread nor an event handle can linger in the USB stack.
+    /// <see cref="WriteTimeoutMs"/>, so a stalled device can never block the
+    /// heartbeat loop. If the system starts suspending mid-write the transfer is
+    /// parked (not cancelled) and reported as
+    /// <see cref="WriteResult.Interrupted"/>: cancelling during a power transition
+    /// leaves the USB port wedged until the next sleep/resume cycle.
     /// </summary>
     private WriteResult WriteHeartbeat(byte[] payload)
     {
         var device = _device;
-        if (device == null)
+        if (device == null || !device.IsOpen)
             return WriteResult.Failed;
-
-        try
-        {
-            // Overlapped write mode is required so a stalled transfer can be
-            // cancelled instead of blocking the loop indefinitely.
-            if (!device.IsOpen)
-            {
-                device.OpenDevice(DeviceMode.NonOverlapped, DeviceMode.Overlapped, ShareMode.ShareRead | ShareMode.ShareWrite);
-            }
-        }
-        catch
-        {
-            return WriteResult.Failed;
-        }
 
         var handle = device.WriteHandle;
         if (handle == IntPtr.Zero || handle.ToInt32() == NativeIo.InvalidHandleValue)
@@ -696,13 +797,18 @@ public partial class FluxProDisplayTray : Form
         // keep the OVERLAPPED struct in unmanaged memory so its address is stable
         // across the WriteFile / CancelIoEx calls (they match on that pointer)
         var pOverlapped = Marshal.AllocHGlobal(Marshal.SizeOf<NativeOverlapped>());
+
+        // The kernel writes the final I/O status into the OVERLAPPED block when the
+        // request completes. If we cannot confirm completion we must NOT free it or
+        // close the event, otherwise the kernel writes into freed memory.
+        var release = true;
         try
         {
             Marshal.StructureToPtr(new NativeOverlapped { EventHandle = hEvent }, pOverlapped, false);
 
             var started = NativeIo.WriteFile(handle, payload, (uint)payload.Length, out _, pOverlapped);
             if (!started && Marshal.GetLastWin32Error() != NativeIo.ErrorIoPending)
-                return WriteResult.Failed;
+                return WriteResult.Failed; // no request was queued, nothing to clean up
 
             // if the write completed synchronously the event may not be signaled,
             // so only wait when the request was queued
@@ -718,20 +824,37 @@ public partial class FluxProDisplayTray : Form
                     : WriteResult.Failed;
             }
 
-            if (wait == NativeIo.WaitFailed)
-                return WriteResult.Failed;
+            if (_suspended)
+            {
+                // The machine is going to sleep and the transfer is parked in the
+                // USB stack. Leave it and its OVERLAPPED block alone: the resume
+                // path disposes the handle, which aborts the request cleanly.
+                release = false;
+                return WriteResult.Interrupted;
+            }
 
-            // still not complete: cancel this exact transfer so it cannot linger
-            // after the handle is recycled
-            NativeIo.CancelIoEx(handle, pOverlapped);
+            if (wait != NativeIo.WaitFailed)
+                NativeIo.CancelIoEx(handle, pOverlapped);
+
+            // Wait for the cancellation to actually complete before touching the
+            // OVERLAPPED block. If it does not, leak the block on purpose rather
+            // than risk the kernel writing into freed memory.
+            if (NativeIo.WaitForSingleObject(hEvent, CancelWaitMs) != NativeIo.WaitObject0)
+            {
+                release = false;
+                LogConnection("Cancelled write did not complete; leaking its overlapped block");
+                return WriteResult.TimedOut;
+            }
+
             return WriteResult.TimedOut;
         }
         finally
         {
-            // safe even after cancellation: the I/O manager holds its own
-            // reference to the event until the request finishes
-            NativeIo.CloseHandle(hEvent);
-            Marshal.FreeHGlobal(pOverlapped);
+            if (release)
+            {
+                NativeIo.CloseHandle(hEvent);
+                Marshal.FreeHGlobal(pOverlapped);
+            }
         }
     }
 
@@ -753,7 +876,14 @@ public partial class FluxProDisplayTray : Form
         /// The write did not complete within <see cref="WriteTimeoutMs"/> and
         /// was cancelled. The handle is recycled and a fresh connection is made.
         /// </summary>
-        TimedOut
+        TimedOut,
+
+        /// <summary>
+        /// A power transition interrupted the write. The transfer is left parked
+        /// in the USB stack and the resume path reconnects, so the device is not
+        /// treated as failed.
+        /// </summary>
+        Interrupted
     }
 
     /// <summary>
