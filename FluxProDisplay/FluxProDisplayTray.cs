@@ -44,13 +44,34 @@ public partial class FluxProDisplayTray : Form
     // aborted sleep), writes must not stay parked indefinitely.
     private static readonly TimeSpan MaxSuspendHold = TimeSpan.FromMinutes(3);
 
+    // Maximum time between keep-alive reports. The configured polling interval
+    // (1300 ms by default) leaves very little margin against scheduling delays on
+    // a loaded machine, so heartbeats are sent at this faster rate and only the
+    // sensor readings follow the configured interval.
+    private const int HeartbeatIntervalMs = 600;
+
+    // A gap between successful heartbeats longer than this is logged, so a
+    // flicker episode can be tied to the app missing writes (or cleared of it).
+    private const int HeartbeatGapWarnMs = 2_000;
+
+    // How often a heartbeat health summary is written to the log.
+    private static readonly TimeSpan HealthLogInterval = TimeSpan.FromHours(1);
+
     // other UI components for the tab
     private NotifyIcon _appStatusNotifyIcon = null!;
     private ContextMenuStrip _contextMenuStrip = null!;
 
-    private PeriodicTimer? _pollTimer;
+    private Thread? _heartbeatThread;
+    private readonly ManualResetEventSlim _stopHeartbeat = new(false);
     private HidDevice? _device;
     private byte[]? _payload;
+
+    // heartbeat timing diagnostics (accessed only from the heartbeat thread)
+    private DateTime _lastWriteUtc;
+    private DateTime _lastGapLogUtc;
+    private int _maxGapMs;
+    private int _writesSinceHealthLog;
+    private DateTime _healthLogStartedUtc;
 
     // write health (accessed only from the update loop thread)
     private int _consecutiveWriteFailures;
@@ -133,9 +154,17 @@ public partial class FluxProDisplayTray : Form
             Logger.LogError(new Exception("Failed to refresh the startup task", ex));
         }
 
-        _ = WriteToDisplay().ContinueWith(
-            t => Logger.LogError(t.Exception!),
-            TaskContinuationOptions.OnlyOnFaulted);
+        // The heartbeat runs on its own above-normal priority thread rather than on
+        // the thread pool: under heavy load (e.g. a game saturating the CPU) pool
+        // continuations can be delayed enough for the panel to miss a keep-alive
+        // report and start flickering.
+        _heartbeatThread = new Thread(HeartbeatLoop)
+        {
+            IsBackground = true,
+            Name = "FluxProDisplay heartbeat",
+            Priority = ThreadPriority.AboveNormal
+        };
+        _heartbeatThread.Start();
     }
     
     private void SetUpTrayIcon()
@@ -392,7 +421,9 @@ public partial class FluxProDisplayTray : Form
         if (disposing)
         {
             SystemEvents.PowerModeChanged -= OnPowerModeChanged;
-            _pollTimer?.Dispose();
+            _stopHeartbeat.Set();
+            _heartbeatThread?.Join(TimeSpan.FromSeconds(2));
+            _stopHeartbeat.Dispose();
             _device?.Dispose();
             _monitor.Dispose();
             components?.Dispose();
@@ -415,24 +446,31 @@ public partial class FluxProDisplayTray : Form
     }
 
     /// <summary>
-    /// Main heartbeat loop. Writes a keep-alive report to the display panel every
-    /// polling tick using the last known temperatures, then refreshes sensor
-    /// readings in the background. Sensor latency and USB write stalls are kept
-    /// off the critical path so the panel never goes without a heartbeat (the
-    /// panel flickers whenever writes are delayed or fail).
+    /// Main heartbeat loop, running on a dedicated above-normal priority thread.
+    /// Writes a keep-alive report to the display panel using the last known
+    /// temperatures, then refreshes sensor readings in the background. Sensor
+    /// latency, USB stalls and scheduling delays are all kept off the critical
+    /// path so the panel never goes without a heartbeat (the panel flickers
+    /// whenever reports are delayed or missing).
     /// </summary>
-    private async Task WriteToDisplay()
+    private void HeartbeatLoop()
     {
-        // interval is in ms, set in appsettings.json
-        _pollTimer = new PeriodicTimer(TimeSpan.FromMilliseconds(_pollingInterval));
+        // Heartbeats are sent at HeartbeatIntervalMs (or the configured polling
+        // interval if that is shorter); sensor readings follow the configured
+        // interval, which is allowed to be slower than the heartbeat.
+        var heartbeatInterval = TimeSpan.FromMilliseconds(Math.Min(_pollingInterval, HeartbeatIntervalMs));
+        var sensorInterval = TimeSpan.FromMilliseconds(_pollingInterval);
 
         // 0 = idle, 1 = sensor refresh running. Sensor reads can block for
         // hundreds of ms (LibreHardwareMonitor hardware updates), so they run on
         // their own task and are skipped while one is still in flight.
         var sensorRefreshBusy = 0;
+        var lastSensorRefreshUtc = DateTime.MinValue;
+        _healthLogStartedUtc = DateTime.UtcNow;
 
-        do
+        while (!_stopHeartbeat.Wait(0))
         {
+            var tickStartedUtc = DateTime.UtcNow;
             try
             {
                 // system resumed from sleep: drop the stale handle and reconnect immediately
@@ -479,6 +517,7 @@ public partial class FluxProDisplayTray : Form
                     if (writeResult == WriteResult.Success)
                     {
                         _consecutiveWriteFailures = 0;
+                        TrackHeartbeat();
                     }
                     else if (writeResult == WriteResult.Interrupted)
                     {
@@ -506,8 +545,10 @@ public partial class FluxProDisplayTray : Form
 
                 // Refresh temperatures AFTER the heartbeat so sensor latency can
                 // only affect data freshness, never the write cadence.
-                if (Interlocked.CompareExchange(ref sensorRefreshBusy, 1, 0) == 0)
+                if (sensorRefreshBusy == 0 && tickStartedUtc - lastSensorRefreshUtc >= sensorInterval &&
+                    Interlocked.CompareExchange(ref sensorRefreshBusy, 1, 0) == 0)
                 {
+                    lastSensorRefreshUtc = tickStartedUtc;
                     _ = Task.Run(() =>
                     {
                         try
@@ -549,7 +590,49 @@ public partial class FluxProDisplayTray : Form
                 // never let a single bad tick kill the update loop
                 Logger.LogError(ex);
             }
-        } while (await _pollTimer.WaitForNextTickAsync());
+
+            // pace the next heartbeat, discounting the time this tick took
+            var remaining = heartbeatInterval - (DateTime.UtcNow - tickStartedUtc);
+            if (remaining > TimeSpan.Zero)
+            {
+                if (_stopHeartbeat.Wait(remaining))
+                    break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Records the interval between successful heartbeats. Gaps beyond what the
+    /// panel tolerates are logged, and an hourly summary is written so a flicker
+    /// episode can be checked against the app's actual write cadence.
+    /// </summary>
+    private void TrackHeartbeat()
+    {
+        var now = DateTime.UtcNow;
+
+        if (_lastWriteUtc != default)
+        {
+            var gapMs = (int)(now - _lastWriteUtc).TotalMilliseconds;
+            if (gapMs > _maxGapMs)
+                _maxGapMs = gapMs;
+
+            if (gapMs >= HeartbeatGapWarnMs && now - _lastGapLogUtc > TimeSpan.FromMinutes(1))
+            {
+                _lastGapLogUtc = now;
+                LogConnection($"Heartbeat gap of {gapMs} ms (worst {_maxGapMs} ms)");
+            }
+        }
+
+        _lastWriteUtc = now;
+        _writesSinceHealthLog++;
+
+        if (now - _healthLogStartedUtc >= HealthLogInterval)
+        {
+            LogConnection($"Heartbeat health: {_writesSinceHealthLog} writes, worst gap {_maxGapMs} ms");
+            _writesSinceHealthLog = 0;
+            _maxGapMs = 0;
+            _healthLogStartedUtc = now;
+        }
     }
 
     /// <summary>
